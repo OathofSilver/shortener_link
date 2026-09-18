@@ -18,3 +18,11 @@ type ShowRequest struct {
 type ShowResponse struct {
 	LongURL string `json:"longUrl"`
 }
+
+type StatsRequest struct {
+	ShortURL string `path:"shortUrl" validate:"required"`
+}
+
+type StatsResponse struct {
+	Total int64 `json:"total"`
+}

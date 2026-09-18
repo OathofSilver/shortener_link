@@ -21,4 +21,9 @@ type Config struct {
 	BaseString        string   //base62指定基础字符串
 	ShortUrlBlackList []string //短域名黑名单列表
 	ShortDomain       string   //短域名
+
+	RabbitMQ struct {
+		URL          string // amqp链接 amqp://user:pass@host:port/
+		FallbackFile string // 发布失败时的本地补偿文件路径(消息落盘，后台定时重发)
+	}
 }

@@ -9,16 +9,20 @@ import (
 	"github.com/zeromicro/go-zero/core/stores/sqlx"
 	"shortener/shortener/internal/config"
 	"shortener/shortener/model"
+	"shortener/shortener/pkg/mq"
 	"shortener/shortener/sequence"
 )
 
 type ServiceContext struct {
 	Config            config.Config
-	Sequence          sequence.Sequence      //sequence
+	Sequence          sequence.Sequence      //sequence 发号器
 	ShortUrlModel     model.ShortUrlMapModel //short_url_map
+	StatsModel        model.ShortUrlStatsModel //short_url_stats 跳转计数表
 	ShortUrlBlackList map[string]struct{}
 	//Filter            *BloomFilter.BloomFilter //bloom filter布隆过滤器 "github.com/bits-and-blooms/bloom/v3"
 	Filter *bloom.Filter //布隆过滤器"github.com/zeromicro/go-zero/core/bloom"
+	Redis  *redis.Redis  //点击统计：消息幂等去重 + 短链计数值
+	MQ     *mq.RabbitMQ  //RabbitMQ 生产端(点击事件投递)
 }
 
 func NewServiceContext(c config.Config) *ServiceContext {
@@ -51,8 +55,13 @@ func NewServiceContext(c config.Config) *ServiceContext {
 		Sequence: sequence.NewMySQL(c.SequenceDB.DSN),
 		//Sequence:      sequence.NewRedis(c.Redis.Host),
 		ShortUrlModel:     model.NewShortUrlMapModel(sqlConn, c.CacheRedis),
+		StatsModel:        model.NewShortUrlStatsModel(sqlConn),
 		ShortUrlBlackList: m, //短链接黑名单map
 		Filter:            filter,
+		Redis: redis.New(c.Redis.Host, func(r *redis.Redis) {
+			r.Type = redis.NodeType
+		}),
+		MQ: mq.NewRabbitMQ(c.RabbitMQ.URL, c.RabbitMQ.FallbackFile),
 	}
 }
 

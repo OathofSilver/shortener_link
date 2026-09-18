@@ -14,3 +14,7 @@ BaseString: aWc9de0fgSi2jklNmn1opqEhUsbTvw3yzABC4DFGHxIJrKuL5MOP6QtR7VXY8Z
 ShortUrlBlackList: ["version","api","fuck","health","convert","stupid","css","js"]
 ShortDomain: yang.cn
 
+RabbitMQ:
+  URL: amqp://guest:guest@127.0.0.1:5672/
+  FallbackFile: ./data/click_fallback.log
+

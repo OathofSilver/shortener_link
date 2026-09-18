@@ -67,6 +67,12 @@ func (l *ShowLogic) Show(req *types.ShowRequest) (resp *types.ShowResponse, err 
 		logx.Errorw(" show_ShortUrlModel.FindOneBySurl failed", logx.LogField{Key: "err", Value: err.Error()})
 		return nil, errors.New("内部错误")
 	}
-	//2.返回查询到的长链接，在调用handler层返回重定向的响应
+
+	//3.点击事件异步投递到 RabbitMQ，由消费端完成计数
+	//注意：放在 DB 查询成功之后(而不是布隆过滤器通过之后)才投递，
+	//避免布隆过滤器假阳性/已删除短链被误计数；布隆过滤器前置拦截的逻辑保持不变
+	l.svcCtx.MQ.PublishClickAsync(l.ctx, req.ShortURL)
+
+	//4.返回查询到的长链接，在调用handler层返回重定向的响应
 	return &types.ShowResponse{LongURL: long.Lurl.String}, nil
 }

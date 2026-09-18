@@ -25,6 +25,13 @@ func RegisterHandlers(server *rest.Server, serverCtx *svc.ServiceContext) {
 				Path:    "/convert",
 				Handler: ConvertHandler(serverCtx),
 			},
+			{
+				// 查询短链累计访问次数
+				// 注意：静态前缀 /stats 优先级高于通配符路由 /:shortUrl，不会冲突
+				Method:  http.MethodGet,
+				Path:    "/stats/:shortUrl",
+				Handler: StatsHandler(serverCtx),
+			},
 		},
 	)
 }
