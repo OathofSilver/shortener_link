@@ -1,0 +1,12 @@
+-- 短链跳转计数表
+-- 每个短链的累计访问次数持久化存储，消费端通过
+-- INSERT ... ON DUPLICATE KEY UPDATE 原子累加，无需依赖事务锁
+CREATE TABLE `short_url_stats` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
+    `surl` VARCHAR(11) NOT NULL COMMENT '短链接',
+    `total_count` BIGINT UNSIGNED NOT NULL DEFAULT '0' COMMENT '累计访问次数',
+    `create_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `update_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uniq_surl` (`surl`)
+) ENGINE = INNODB DEFAULT CHARSET = utf8mb4 COMMENT = '短链跳转计数表';

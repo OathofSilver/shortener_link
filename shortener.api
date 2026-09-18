@@ -20,11 +20,22 @@ type ShowResponse {
 	LongUrl string `json:"longUrl"`
 }
 
+type StatsRequest {
+	ShortUrl string `path:"shortUrl"`
+}
+
+type StatsResponse {
+	Total int64 `json:"total"`
+}
+
 service shortener-api {
 	@handler ConvertHandler
 	post /convert (ConvertRequest) returns (ConvertResponse)
 
 	@handler ShowHandler
 	get /:shortUrl (ShowRequest) returns (ShowResponse)
+
+	@handler StatsHandler
+	get /stats/:shortUrl (StatsRequest) returns (StatsResponse)
 }
 

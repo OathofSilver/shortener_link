@@ -1,4 +1,4 @@
-CCREATE TABLE `short_url_map` (
+CREATE TABLE `short_url_map` (
                                  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
                                  `create_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
                                  `create_by` VARCHAR(64) NOT NULL DEFAULT '' COMMENT '创建者',

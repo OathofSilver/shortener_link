@@ -5,9 +5,10 @@ go 1.23.1
 require (
 	github.com/bits-and-blooms/bloom/v3 v3.7.0
 	github.com/go-playground/validator/v10 v10.26.0
+	github.com/google/uuid v1.6.0
+	github.com/rabbitmq/amqp091-go v1.10.0
 	github.com/smartystreets/goconvey v1.8.1
 	github.com/zeromicro/go-zero v1.8.1
-	golang.org/x/sync v0.11.0
 )
 
 require (
@@ -25,7 +26,6 @@ require (
 	github.com/go-playground/universal-translator v0.18.1 // indirect
 	github.com/go-sql-driver/mysql v1.9.0 // indirect
 	github.com/golang-jwt/jwt/v4 v4.5.1 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/gopherjs/gopherjs v1.17.2 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.20.0 // indirect
 	github.com/jtolds/gls v4.20.0+incompatible // indirect
