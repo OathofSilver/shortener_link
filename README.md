@@ -100,8 +100,43 @@ go get github.com/go-playground/validator/v10
 import "github.com/go-playground/validator/v10"
 在api中为结构体添加validat额tag 并添加校验规则
 
+# 号段模式分布式发号器（sequence/segment.go）
+
+替代逐次 INCR 的 Redis 发号器，架构：**Redis 号段 + 本地双缓冲 + DB checkpoint**。
+
+## 核心机制
+| 机制 | 说明 |
+|------|------|
+| 无锁热路径 | `Next()` 在当前内存号段上 `atomic.AddUint64` 自增，纯内存微秒级 |
+| 双缓冲预加载 | 当前号段用量达 `Threshold`(默认80%) 时，后台 goroutine `INCRBY sequence:segment:{bizTag} step` 批量申请下一号段，CAS flag 保证只有一个预加载 |
+| 无缝切换 | 当前号段耗尽后切到备用槽；备用未就绪时短暂等待后同步申请，超时报 `ErrSegmentNotReady` |
+| checkpoint | **申请号段时落盘**（备用槽激活前）：号段终点写 `sequence_checkpoint` 表（GREATEST 幂等只增），指数退避重试 |
+| 重启恢复 | 读 DB checkpoint 作为安全下界 → Redis 值 < checkpoint 则对齐（跳号不重发）→ 同步加载首段（失败拒绝启动） |
+
+## 正确性论证（为什么"申请时落盘"保证绝不重发）
+号段只有在其终点已写入 DB 后才会被激活发放。因此 **DB `max_id` 永远 ≥ 任何已发放的号**。
+- 崩溃后 Redis 完好 → 从 Redis 位点继续，无跳号
+- 崩溃后 Redis 数据丢失 → 从 DB checkpoint+1 恢复，**跳号但绝不重发**
+- checkpoint 失败 → 该号段永不激活（fail fast）；若 INCRBY 已成功，号被 Redis 锁定并跳过，同样不会重发
+- 残余风险：INCRBY 成功到 checkpoint 落盘之间的毫秒级窗口内崩溃且 Redis 数据全丢 → 理论重发可能，**生产环境 Redis 必须开启 AOF 持久化**
+
+## 降级语义
+- **Redis 不可用**：新号段无法申请，当前号段耗尽后 fail fast 返回错误（正确性优先，不做 DB 直连降级）
+- **DB 不可用**：只阻塞新号段激活（checkpoint 重试耗尽），不影响已激活号段发号
+- **启动时 DB 不可用**：拒绝启动（`logx.Must`），优于带重发风险上线
+
+## 配置
+```yaml
+SequenceSegment:
+  BizTag: shortener   # 业务标识，Redis key: sequence:segment:{bizTag}
+  Step: 10000         # 号段长度
+  Threshold: 80       # 预加载触发阈值(%)
+```
+建表：执行 `shortener/sequence/segment_checkpoint.sql`。
+
 # 查看短链接
 # 缓存版
+
 有两种方式
 1. 使用自己实现的缓存  surl->lurl 能够节省缓存空间，缓存的数据量小
 2. 使用go-zero自带的缓存 surl ->数据行，不需要自己实现，开发量小

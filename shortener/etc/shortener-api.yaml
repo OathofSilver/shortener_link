@@ -4,6 +4,11 @@ Port: 9000
 #实际开发中取号器和存储应该是两个库
 SequenceDB:
   DSN: root:123456@tcp(127.0.0.1:3306)/shorteren?charset=utf8mb4&parseTime=true&loc=Asia%2FShanghai
+# 号段模式发号器配置
+SequenceSegment:
+  BizTag: shortener
+  Step: 10000
+  Threshold: 80
 ShortUrlDB:
   DSN: root:123456@tcp(127.0.0.1:3306)/shorteren?charset=utf8mb4&parseTime=true&loc=Asia%2FShanghai
 CacheRedis:

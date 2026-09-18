@@ -32,6 +32,21 @@ func NewServiceContext(c config.Config) *ServiceContext {
 		m[v] = struct{}{}
 	}
 	sqlConn := sqlx.NewMysql(c.ShortUrlDB.DSN)
+	//号段模式发号器：Redis 号段 + 本地双缓冲 + DB checkpoint 异步落盘
+	//启动即完成恢复(DB checkpoint 为安全下界)并同步加载首段，失败则拒绝启动
+	seqConn := sqlx.NewMysql(c.SequenceDB.DSN)
+	segSeq, err := sequence.NewSegmentRedis(
+		redis.New(c.Redis.Host, func(r *redis.Redis) {
+			r.Type = redis.NodeType
+		}),
+		sequence.NewMySQLCheckpointStore(seqConn),
+		c.SequenceSegment.BizTag,
+		c.SequenceSegment.Step,
+		c.SequenceSegment.Threshold,
+	)
+	if err != nil {
+		logx.Must(err) //启动期致命错误：无法保证不重发的发号器不能带病上线
+	}
 	//初始化布隆过滤器
 	//初始化redisBitSet
 	store := redis.New(c.CacheRedis[0].Host, func(r *redis.Redis) {
@@ -52,7 +67,7 @@ func NewServiceContext(c config.Config) *ServiceContext {
 	//}
 	return &ServiceContext{
 		Config:   c,
-		Sequence: sequence.NewMySQL(c.SequenceDB.DSN),
+		Sequence: segSeq, //号段模式发号器(可切回 sequence.NewMySQL / sequence.NewRedis)
 		//Sequence:      sequence.NewRedis(c.Redis.Host),
 		ShortUrlModel:     model.NewShortUrlMapModel(sqlConn, c.CacheRedis),
 		StatsModel:        model.NewShortUrlStatsModel(sqlConn),

@@ -22,6 +22,12 @@ type Config struct {
 	ShortUrlBlackList []string //短域名黑名单列表
 	ShortDomain       string   //短域名
 
+	SequenceSegment struct {
+		BizTag    string //号段业务标识，默认 shortener
+		Step      int    //号段长度(每次向 Redis 批量申请的号数量)，默认 10000
+		Threshold int    //预加载触发阈值(当前号段用量百分比)，默认 80
+	}
+
 	RabbitMQ struct {
 		URL          string // amqp链接 amqp://user:pass@host:port/
 		FallbackFile string // 发布失败时的本地补偿文件路径(消息落盘，后台定时重发)
