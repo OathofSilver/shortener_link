@@ -5,7 +5,7 @@ CREATE TABLE `short_url_map` (
                                  `is_del` TINYINT UNSIGNED NOT NULL DEFAULT '0' COMMENT '是否删除：0正常1删除',
                                  `lurl` VARCHAR(2048) DEFAULT NULL COMMENT '长链接',
                                  `md5` CHAR(32) DEFAULT NULL COMMENT '长链接MD5',
-                                 `surl` VARCHAR(11) DEFAULT NULL COMMENT '短链接',
+                                 `surl` VARCHAR(11) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL COMMENT '短链接',
                                  PRIMARY KEY (`id`),
                                  INDEX(`is_del`),
                                  UNIQUE(`md5`),

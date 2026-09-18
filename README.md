@@ -1,187 +1,206 @@
-# 短链接服务（shortener-api）
+# 短链接服务(shortener)
 
-基于 go-zero 框架的短链接服务：将长链接转为短链接，访问短链接时 302 重定向回原始长链接，并通过 RabbitMQ 异步统计每个短链的访问次数。
+> 基于 go-zero 的短链接服务,完整覆盖**链接生成、短链跳转、访问统计**三大核心链路。
+> author: yang
+> 代码生成:`goctl api go -api shortener.api -dir ./shortener --style go_zero`
 
-技术栈：Go 1.23 · go-zero v1.8 · MySQL · Redis · RabbitMQ
+---
 
-## 功能特性
+## 一、项目定位与背景
 
-- **转链**：长链接 → 短链接（6 位左右 base62 字符串），同一长链接通过 MD5 判重，重复转链直接返回已有短链
-- **跳转**：访问短链接 302 重定向到长链接
-- **访问统计**：跳转请求通过 RabbitMQ 异步投递点击事件，消费端计数，解析主流程零阻塞、最终一致
-- **发号器**：号段模式分布式发号器（Redis 号段 + 本地双缓冲 + DB checkpoint），热路径无锁、重启恢复绝不重发；另保留 MySQL / Redis 两种简单实现可切换
-- **高并发防护**：
-  - Redis 布隆过滤器前置拦截不存在的短链，防缓存穿透
-  - go-zero sqlc 缓存自带 singleflight，防缓存击穿
-- **可靠性**：MQ 生产端 publisher confirm + 失败落盘补偿重发 + 断线自动重连；消费端 Redis 幂等去重、失败重试 3 次后进死信队列
+1. **短链接(Short Link)**
+   通过特定算法将长 URL 压缩为更短、易记的 URL,核心价值包括:
+   - **缩短字符**:减少 URL 长度,节省空间(如短信、社交媒体场景)。
+   - **提升体验**:便于记忆、分享和传播,避免长 URL 的视觉干扰。
+   - **数据分析**:记录访问次数等数据,支持营销效果追踪。
 
-## 环境依赖
+2. **本项目定位**
+   一个 Go 语言实现的高并发短链接服务,自增 ID + 乱序 Base62 生成短码,重点关注**取号、缓存与异步计数**三块工程实践:号段模式发号器、布隆过滤器防穿透、RabbitMQ 异步统计链路。
 
-| 依赖 | 版本建议 | 用途 |
-|------|---------|------|
-| Go | ≥ 1.23 | 编译运行 |
-| MySQL | 8.x | 长短链映射、跳转计数、发号器 checkpoint |
-| Redis | 6.x+ | 发号器号段、布隆过滤器、缓存、计数热数据 |
-| RabbitMQ | 3.x | 点击事件异步投递 |
-| goctl（可选） | 1.7.x | 重新生成 API/Model 代码时需要 |
+3. **技术选型**
 
-## 快速开始
+| **组件** | **选型** | **说明** |
+|------------------|--------------------------------|--------------------------------------------------------------|
+| **Web 框架** | go-zero v1.8.1(Go 1.23) | goctl 生成 handler/logic/types,自带行缓存与 singleflight |
+| **存储** | MySQL | 长短链映射、计数真源;取号器独立 DSN(实际开发中应分库) |
+| **缓存** | Redis | 布隆过滤器 bitset、行缓存、号段计数、点击计数与幂等标记 |
+| **消息队列** | RabbitMQ | 点击事件异步削峰,direct 交换机 + 死信队列拓扑 |
+| **发号器** | 号段模式 | Redis 号段 + 本地双缓冲 + DB checkpoint,可切换 MySQL/Redis 实现 |
 
-### 1. 建库建表
+---
 
-创建数据库（名称与配置文件一致，本项目为 `shorteren`），然后依次执行根目录与 sequence 目录下的 SQL：
+## 二、核心功能
 
-```bash
-mysql -uroot -p -e "CREATE DATABASE shorteren DEFAULT CHARSET utf8mb4;"
+### 1. 链接生成(POST /convert)
 
-mysql -uroot -p shorteren < sequence.sql               # 发号器序号表（MySQL 发号器实现用）
-mysql -uroot -p shorteren < short_url_map.sql          # 长短链映射表
-mysql -uroot -p shorteren < short_url_stats.sql        # 跳转计数表
-mysql -uroot -p shorteren < shortener/sequence/segment_checkpoint.sql  # 号段 checkpoint 表
+输入一个长链接,转为短链接,流程如下:
+
+1. **可达性探测**:用全局连接池的 HTTP Client(2s 超时)请求长链接,状态码非 200 视为无效;连接池复用 TCP 连接,避免高并发下 TIME_WAIT 耗尽本机端口。
+2. **MD5 查重**:对长链接求 MD5(32 位十六进制)后按 `md5` 唯一索引查库,已转过的链接直接返回已有短码;用 MD5 建索引而非直接索引长链接,避免长字符串索引耗时。
+3. **防循环转链**:提取 URL path 最后一段,若能在 `short_url_map` 中查到,说明输入的已经是短链,拒绝转换。
+4. **取号 + 转码**:发号器取一个全局自增号,经**乱序 Base62** 转为短码(字符表在配置文件中打乱,防止短码被猜测遍历);命中黑名单(如 `api`、`health`)则重新取号。
+5. **存储映射**:长短链映射写入 MySQL,同时把短码加入布隆过滤器,返回 `短域名/短码`。
+
+### 2. 短链跳转(GET /:shortUrl)
+
+1. **布隆过滤器前置拦截**:短码不存在直接返回 404,不触碰缓存与数据库,**防止缓存穿透**;过滤器基于 Redis bitset(约 2000 万 bit),服务重启后从 MySQL 分页回灌全量短码。
+2. **查缓存/数据库**:按 `surl` 查长短链映射,走 go-zero 行缓存,自带 **singleflight**,并发请求同一失效短码时只放一个请求回源,**防止缓存击穿**。
+3. **异步计数**:DB 查询成功后,点击事件异步投递 RabbitMQ(不阻塞重定向主流程);投递放在查询成功之后而非过滤器通过之后,避免布隆假阳性/已删除短链被误计数。
+4. **302 重定向**:handler 返回 `http.StatusFound` 临时重定向到长链接。
+
+### 3. 访问统计(GET /stats/:shortUrl)
+
+- **读路径**:先查 Redis 计数器 `stats:click:count:{surl}`(消费端维护的热点值),未命中回源 MySQL 计数表(真源),再以 **SETNX** 回填 Redis——不用 SET,避免旧值覆盖消费端刚 INCR 出的新值。
+- **写路径**:见「三、异步统计链路」。
+
+### 接口一览
+
+| **功能** | **方法/路径** | **入参** | **出参** |
+|--------------|------------------------|------------|------------------------------|
+| 转链 | POST /convert | longUrl | shortUrl(短域名/短码) |
+| 跳转 | GET /:shortUrl | 短码 | 302 重定向到长链接 |
+| 统计 | GET /stats/:shortUrl | 短码 | total(累计点击次数) |
+
+---
+
+## 三、技术架构与关键技术
+
+```
+转链链路(POST /convert)
+  长链接 → 可达性探测 → MD5 查重 → 防循环转链 → 发号器取号 → Base62+黑名单
+        → 写 MySQL(short_url_map)+ 布隆过滤器 → 返回 短域名/短码
+
+跳转链路(GET /:shortUrl)
+  短码 → 布隆过滤器(不存在 → 404) → 行缓存/singleflight → MySQL 查长链
+        → 302 重定向
+        └─(异步)点击事件 → RabbitMQ → 消费者(幂等去重 → MySQL 累加 → Redis INCR)
+
+统计链路(GET /stats/:shortUrl)
+  Redis 计数器 → 未命中回源 MySQL → SETNX 回填
 ```
 
-### 2. 下载依赖
+### 1. 发号器:号段模式(核心)
 
-```bash
-go mod tidy
+`sequence` 包提供三种实现,统一实现 `Sequence` 接口,当前默认启用号段模式:
+
+| **实现** | **原理** | **特点** |
+|--------------|----------------------------------------|------------------------------------------------|
+| MySQL 发号器 | `REPLACE INTO sequence` + LAST_INSERT_ID | 实现最简单,每次取号一次 DB 写入 |
+| Redis 发号器 | INCR 原子自增 | 性能好,Redis 数据丢失会重号 |
+| **号段模式(默认)** | Redis INCRBY 批量取号段 + 本地双缓冲 + DB checkpoint | 热路径纯内存微秒级,重启只跳号不重发 |
+
+号段模式的关键设计(详见 `sequence/segment.go` 头注释):
+
+1. **热路径无锁**:`Next()` 在当前内存号段上 atomic 自增,纯内存操作,仅在号段边界走慢路径。
+2. **双缓冲**:当前号段用量达阈值(默认 80%)时,后台 goroutine 通过 Redis INCRBY 批量申请下一号段(默认 10000 个)填入备用槽;当前号段耗尽后无缝切换。
+3. **checkpoint**:申请号段时先把号段终点写 MySQL(`GREATEST` 幂等只增),保证 DB 记录值 ≥ 任何已发放的号;顺序不可颠倒——checkpoint 成功先于号段可用,是"绝不重发"的根本保证。
+4. **崩溃恢复**:启动时读 DB checkpoint 作为安全下界,对齐 Redis 计数器(取 `max(dbMax, redisVal)`),只跳号、绝不重发;恢复失败则拒绝启动,发号器不能带病上线。
+5. **降级**:Redis 不可用 → 新号段无法申请 → 当前号段耗尽后 fail fast;DB 不可用 → 只阻塞新号段激活,不影响已激活号段发号。
+6. **多实例安全**:Redis INCRBY 是号段分配的唯一协调点,各实例号段天然不重叠;checkpoint 乱序到达也不会回退。
+
+### 2. 缓存:布隆过滤器 + singleflight
+
+- **布隆过滤器**:`github.com/zeromicro/go-zero/core/bloom`,bit 存于 Redis(key `bloom_filter`),进程无状态、重启不丢;启动时分页加载 `short_url_map` 全量短码回灌。
+- **singleflight**:go-zero 行缓存内置,同一短码缓存失效时合并并发回源请求。
+- 计数表 `short_url_stats` 更新极其频繁,**不走行缓存**,消费端直连 MySQL 原子累加。
+
+### 3. 异步统计链路:RabbitMQ
+
+**生产端**(`pkg/mq/rabbitmq.go`,封装于 `mq.RabbitMQ`):
+
+1. 拓扑幂等声明:direct 交换机 + 持久化点击队列 + 死信交换机/队列(承接格式错误或重试耗尽的消息)。
+2. **发布确认(publisher confirm)**:等待 broker 落盘回执,未确认视为投递失败。
+3. **失败重试 + 本地补偿**:重试多次仍失败时消息按行落盘(`FallbackFile`),后台每分钟扫描重发,成功后移除。
+4. **断线自动重连**:连接断开后后台重建连接与拓扑;初始连接失败不报错,期间消息走补偿,保证不丢。
+
+**消费端**(`internal/consumer/click_consumer.go`,单条消息流程):
+
+1. 消息格式校验,解析失败直接进死信队列。
+2. Redis `SETNX(msgId)` 幂等校验,重复消息直接 ACK 丢弃(幂等标记 TTL 3 天,覆盖常规重投窗口)。
+3. MySQL `INSERT ... ON DUPLICATE KEY UPDATE` 原子累加计数(最终真源)。
+4. Redis INCR 同步短链计数值(尽力而为,失败仅记日志不回滚,可由查询接口回源修复)。
+
+可靠性保障:
+
+- **MySQL 写失败**:删除幂等标记 → 重新投递 `retry+1` 的消息 → 3 次耗尽进死信队列。
+- **消费实例宕机**:未 ACK 的消息由 broker 重新投递,幂等标记防止重复计数。
+- **限流**:prefetch 100,未确认消息超限不再下发,避免消费者被打垮。
+
+### 4. 数据表设计
+
+| **表** | **职责** | **关键设计** |
+|-----------------------|--------------------|--------------------------------------------------|
+| `short_url_map` | 长短链映射 | `md5`、`surl` 唯一索引;`lurl` 最长 2048 |
+| `short_url_stats` | 跳转计数(真源) | `uniq_surl` 唯一键 + ON DUPLICATE KEY UPDATE 原子累加 |
+| `sequence` | MySQL 发号器序号表 | REPLACE INTO 后取自增主键 |
+| `sequence_checkpoint` | 号段 checkpoint | `biz_tag` 主键,`max_id` GREATEST 只增,作为恢复安全下界 |
+
+---
+
+## 四、使用方式
+
+### 1. 环境准备
+
+依赖:Go 1.23+、MySQL、Redis、RabbitMQ。
+
+依次执行建表 SQL(库名与 DSN 保持一致):
+
+```sql
+source short_url_map.sql;        -- 长短链映射表
+source short_url_stats.sql;      -- 跳转计数表
+source sequence.sql;             -- MySQL 发号器序号表(可选实现)
+source shortener/sequence/segment_checkpoint.sql;  -- 号段 checkpoint 表(必须)
 ```
 
-### 3. 修改配置
+### 2. 配置说明
 
-配置文件：`shortener/etc/shortener-api.yaml`，主要配置项：
+配置文件 `shortener/etc/shortener-api.yaml`:
 
-| 配置项 | 说明 | 默认值 |
-|--------|------|--------|
-| `Host` / `Port` | HTTP 监听地址 | `0.0.0.0:9000` |
-| `SequenceDB.DSN` | 发号器 MySQL 连接串 | `root:123456@tcp(127.0.0.1:3306)/shorteren` |
-| `ShortUrlDB.DSN` | 业务 MySQL 连接串 | 同上 |
-| `CacheRedis` / `Redis.Host` | Redis 地址 | `127.0.0.1:6379` |
-| `RabbitMQ.URL` | AMQP 连接串 | `amqp://guest:guest@127.0.0.1:5672/` |
-| `RabbitMQ.FallbackFile` | 发布失败补偿文件路径 | `./data/click_fallback.log` |
-| `BaseString` | base62 乱序字符表 | 62 位自定义字符串 |
-| `ShortDomain` | 短链域名前缀 | `yang.cn` |
-| `ShortUrlBlackList` | 短链黑名单（禁用词） | api、health、convert 等 |
-| `SequenceSegment` | 号段发号器：`BizTag` / `Step`(10000) / `Threshold`(80) | — |
+| **配置项** | **示例/默认** | **说明** |
+|--------------------|----------------------------------------|--------------------------------------------|
+| Host / Port | 0.0.0.0:9000 | 监听地址 |
+| SequenceDB / ShortUrlDB | MySQL DSN | 取号器与业务存储分开配置(实际开发应分库) |
+| CacheRedis / Redis | 127.0.0.1:6379 | 布隆 bitset、行缓存;号段计数、点击计数与幂等 |
+| BaseString | 62 个乱序字符 | 乱序 Base62 字符表,防短码被猜测 |
+| ShortUrlBlackList | version、api、health… | 短码黑名单,命中则重新取号 |
+| ShortDomain | yang.cn | 拼接返回的短域名 |
+| SequenceSegment | BizTag=shortener、Step=10000、Threshold=80 | 号段业务标识、号段长度、预加载阈值(%) |
+| RabbitMQ | amqp://… + FallbackFile | 点击事件投递地址与本地补偿文件路径 |
 
-### 4. 启动
+### 3. 启动服务
 
 ```bash
 cd shortener
-go run shortener.go
+go run shortener.go            # 默认读取 etc/shortener-api.yaml
 ```
 
-看到以下输出即启动成功（服务同时完成：发号器恢复 + 首段加载、布隆过滤器数据回灌、MQ 消费者启动）：
+启动时会打印配置、初始化布隆过滤器(从 MySQL 回灌全量短码)、加载首个号段(checkpoint 失败会拒绝启动),并以后台协程拉起点击事件消费者。
 
-```
-Starting server at 0.0.0.0:9000...
-```
-
-## API 使用示例
-
-> 注意：路由挂载在根路径（无 `/api` 前缀）。
-
-**转链**
+### 4. 快速体验
 
 ```bash
+# 转链:长链接 → 短链接
 curl -X POST http://127.0.0.1:9000/convert \
   -H "Content-Type: application/json" \
   -d '{"longUrl":"https://github.com/zeromicro/go-zero"}'
-# {"shortUrl":"yang.cn/W"}
+# 返回 {"shortUrl":"yang.cn/xxxx"}
+
+# 跳转:访问短码,302 重定向到长链接
+curl -i http://127.0.0.1:9000/xxxx
+
+# 统计:查询该短链累计点击次数
+curl http://127.0.0.1:9000/stats/xxxx
+# 返回 {"total":1}
 ```
 
-转链前置校验：长链接非空（validator required）→ 链接可达性探测 → 非短链本身（防循环转链）→ MD5 判重。
-
-**跳转**
+### 5. 运行测试
 
 ```bash
-curl -i http://127.0.0.1:9000/W
-# HTTP/1.1 302 Found
-# Location: https://github.com/zeromicro/go-zero
+go test ./...
 ```
 
-**查询访问次数**
+覆盖 Base62 编解码、MD5、URL 工具、可达性探测,以及号段发号器(基于 miniredis 与 fake checkpoint,验证双缓冲切换、崩溃恢复、故障降级)。
 
-```bash
-curl http://127.0.0.1:9000/stats/W
-# {"total":2}
-```
+---
 
-## 核心设计
-
-### 号段模式分布式发号器（`shortener/sequence/segment.go`）
-
-| 机制 | 说明 |
-|------|------|
-| 无锁热路径 | `Next()` 在当前内存号段上 `atomic.AddUint64` 自增，微秒级 |
-| 双缓冲预加载 | 当前号段用量达 `Threshold`(默认 80%) 时，后台 goroutine `INCRBY sequence:segment:{bizTag} step` 申请下一号段，CAS 保证单预加载 |
-| 无缝切换 | 当前号段耗尽切到备用槽；备用未就绪时短暂等待后同步申请，超时返回 `ErrSegmentNotReady` |
-| checkpoint | **申请号段时落盘**（备用槽激活前）：号段终点写 `sequence_checkpoint` 表（GREATEST 幂等只增），指数退避重试 |
-| 重启恢复 | 读 DB checkpoint 为安全下界 → 与 Redis 值取大对齐（跳号不重发）→ 同步加载首段，失败拒绝启动 |
-
-**正确性**：号段只有在终点写入 DB 后才激活发放，故 DB `max_id` 永远 ≥ 任何已发放的号——崩溃后从 checkpoint+1 恢复，只跳号、绝不重发。残余风险：INCRBY 成功到 checkpoint 落盘的毫秒级窗口内崩溃且 Redis 数据全丢（生产环境 Redis 需开启 AOF）。
-
-**降级语义**：Redis 不可用 → 号段耗尽后 fail fast（正确性优先）；DB 不可用 → 只阻塞新号段激活，不影响已激活号段发号；启动时 DB 不可用 → 拒绝启动。
-
-多实例安全：Redis INCRBY 是号段分配的唯一协调点，各实例号段天然不重叠。
-
-### RabbitMQ 访问统计
-
-拓扑（均持久化，代码自动声明，幂等）：
-
-| 组件 | 名称 |
-|------|------|
-| 交换机 | `shortener.stats.exchange`（direct） |
-| 队列 | `shortener.stats.click.queue`（配置死信转发） |
-| 死信交换机/队列 | `shortener.stats.dlx` / `shortener.stats.click.dlq` |
-
-消息体（JSON）：`msgId`（幂等键）/ `surl` / `clickedAt` / `retry`。
-
-- **生产端**（`pkg/mq` + ShowLogic）：DB 查询成功后异步投递（放 DB 成功之后而非布隆通过之后，避免假阳性误计数）；publisher confirm 保证到达，失败重试 3 次 → 落盘 `FallbackFile` 后台每分钟重发；断线自动重连并重建拓扑
-- **消费端**（`internal/consumer`）：Redis `SETNX stats:click:consumed:{msgId}`（TTL 3 天）幂等 → MySQL `INSERT ... ON DUPLICATE KEY UPDATE` 原子累加（真源）→ Redis `INCR stats:click:count:{surl}` 同步热点值（尽力而为）；MySQL 写失败删除幂等标记后重投，3 次耗尽进死信队列；未 ACK 消息由 broker 重投 + 幂等标记防重复计数
-- **查询接口**：Redis 计数器 → MySQL 回源（SETNX 回填，避免覆盖消费端新值）
-
-### 关于本地缓存的说明
-
-代码中未启用进程内 L1 本地缓存，缓存均为 Redis 版：go-zero sqlc CachedConn（缓存整个数据行，自带 singleflight 防击穿）+ Redis 布隆过滤器（拦截不存在的短链）。计数链路不受影响。
-
-## 目录结构
-
-```
-short-link-system/
-├── shortener.api                  # API 定义文件（goctl 生成代码的来源）
-├── sequence.sql                   # 发号器序号表（MySQL 发号器实现用）
-├── short_url_map.sql              # 长短链映射表
-├── short_url_stats.sql            # 跳转计数表
-└── shortener/
-    ├── shortener.go               # 入口：加载配置、初始化依赖、启动消费者与 HTTP 服务
-    ├── etc/
-    │   └── shortener-api.yaml     # 配置文件
-    ├── internal/
-    │   ├── config/config.go       # 配置结构体（与 yaml 必须对齐）
-    │   ├── handler/               # HTTP 处理器（goctl 生成）：convert / show / stats
-    │   ├── logic/                 # 业务逻辑：转链、跳转、统计查询
-    │   ├── consumer/              # RabbitMQ 点击事件消费端
-    │   ├── svc/                   # ServiceContext：组装发号器、模型、布隆过滤器、MQ
-    │   └── types/types.go         # 请求/响应结构体（含 validator 标签）
-    ├── model/                     # goctl 生成的 MySQL model（short_url_map 带 sqlc 缓存）
-    ├── pkg/
-    │   ├── base62/                # 乱序 base62 编码（号 → 短码）
-    │   ├── connect/               # 长链接可达性探测
-    │   ├── md5/                   # 长链接 MD5（判重索引）
-    │   ├── urltool/               # URL 路径提取（防循环转链）
-    │   └── mq/                    # RabbitMQ 生产端封装（拓扑声明/confirm/重试/补偿/重连）
-    └── sequence/                  # 发号器：mysql.go / redis.go（简单实现）、segment.go（号段模式，默认）
-        └── segment_checkpoint.sql # checkpoint 建表语句
-```
-
-## 重新生成代码（可选）
-
-```bash
-# API 层
-goctl api go -api shortener.api -dir ./shortener --style go_zero
-
-# Model 层（short_url_map 需带 -c 开启缓存）
-goctl model mysql datasource -url="root:123456@tcp(127.0.0.1:3306)/shorteren" -table="short_url_map" -dir="./shortener/model" -c
-```
-
-> 注意：重新生成后需保留 `types.go` 中的 validator 标签等手写改动；`service_context.go` 中的发号器装配（号段模式）为手写逻辑，不会被生成覆盖。
+以上内容依据项目代码与建表 SQL 整理,可作为快速了解本服务的入口;各模块更细的实现说明见对应包内的注释(推荐从 `sequence/segment.go` 与 `pkg/mq/rabbitmq.go` 读起)。

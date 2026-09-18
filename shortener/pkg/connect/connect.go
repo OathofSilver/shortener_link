@@ -7,10 +7,15 @@ import (
 )
 
 // client 全局的HTTP客户端
-// 不是长连接   设置超时时间
+// 使用连接池复用 TCP 连接：探测在转链请求路径上，若每次新建连接(DisableKeepAlives)，
+// 高并发下客户端 TIME_WAIT 会耗尽本机动态端口(Windows 默认约 1.6 万个)，导致探测批量失败
 var client = &http.Client{
-	Transport: &http.Transport{DisableKeepAlives: true},
-	Timeout:   2 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        2000,
+		MaxIdleConnsPerHost: 2000,
+		IdleConnTimeout:     90 * time.Second,
+	},
+	Timeout: 2 * time.Second,
 }
 
 // Get 判断url是否能请求通
